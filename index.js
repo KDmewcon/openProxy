@@ -2,6 +2,9 @@
 
 const net = require("net");
 const ProxyChain = require("proxy-chain");
+const simpleSocksModule = require("simple-socks");
+
+const simpleSocks = simpleSocksModule.default || simpleSocksModule;
 
 function toPort(rawValue, fallback) {
   const value = Number(rawValue);
@@ -28,6 +31,12 @@ function logClient(protocol, client, detail) {
 
 function logSocketClient(protocol, socket, detail) {
   logClient(protocol, getSocketClient(socket), detail);
+}
+
+function getInfoClient(info) {
+  return `${info && info.address ? info.address : "unknown"}:${
+    info && info.port ? info.port : "?"
+  }`;
 }
 
 class SocketReader {
@@ -169,11 +178,6 @@ function sendSocks4Reply(socket, status) {
   socket.write(Buffer.from([0x00, status, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
 }
 
-function sendSocks5Reply(socket, status) {
-  // Reply with IPv4 0.0.0.0:0 as bind address.
-  socket.write(Buffer.from([0x05, status, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
-}
-
 async function handleSocks4(socket, firstChunk) {
   const client = getSocketClient(socket);
   const reader = new SocketReader(socket, firstChunk.subarray(1));
@@ -225,123 +229,6 @@ async function handleSocks4(socket, firstChunk) {
     }
 
     sendSocks4Reply(socket, 0x5a);
-
-    const buffered = reader.takeBuffered();
-    reader.release();
-    if (buffered.length) {
-      upstream.write(buffered);
-    }
-
-    createPipeBetween(socket, upstream);
-  } catch {
-    reader.release();
-    socket.destroy();
-  }
-}
-
-async function handleSocks5(socket, firstChunk) {
-  const client = getSocketClient(socket);
-  const reader = new SocketReader(socket, firstChunk.subarray(1));
-
-  try {
-    const nMethodsRaw = await reader.readBytes(1);
-    if (!nMethodsRaw) return socket.destroy();
-
-    const nMethods = nMethodsRaw[0];
-    const methods = await reader.readBytes(nMethods);
-    if (!methods) return socket.destroy();
-
-    if (!methods.includes(0x02)) {
-      socket.write(Buffer.from([0x05, 0xff]));
-      return socket.end();
-    }
-
-    socket.write(Buffer.from([0x05, 0x02]));
-
-    const authVersionAndLen = await reader.readBytes(2);
-    if (!authVersionAndLen) return socket.destroy();
-
-    const authVersion = authVersionAndLen[0];
-    const unameLen = authVersionAndLen[1];
-    if (authVersion !== 0x01) {
-      socket.write(Buffer.from([0x01, 0x01]));
-      return socket.end();
-    }
-
-    const unameRaw = await reader.readBytes(unameLen);
-    if (!unameRaw) return socket.destroy();
-
-    const passLenRaw = await reader.readBytes(1);
-    if (!passLenRaw) return socket.destroy();
-
-    const passLen = passLenRaw[0];
-    const passRaw = await reader.readBytes(passLen);
-    if (!passRaw) return socket.destroy();
-
-    const username = unameRaw.toString("utf8");
-    const password = passRaw.toString("utf8");
-
-    if (username !== USERNAME || password !== PASSWORD) {
-      logClient("SOCKS5", client, `auth failed user=${username || "(empty)"}`);
-      socket.write(Buffer.from([0x01, 0x01]));
-      return socket.end();
-    }
-
-    socket.write(Buffer.from([0x01, 0x00]));
-
-    const requestHead = await reader.readBytes(4);
-    if (!requestHead) return socket.destroy();
-
-    const version = requestHead[0];
-    const command = requestHead[1];
-    const addrType = requestHead[3];
-
-    if (version !== 0x05 || command !== 0x01) {
-      sendSocks5Reply(socket, 0x07);
-      return socket.end();
-    }
-
-    let host;
-    if (addrType === 0x01) {
-      const ipv4 = await reader.readBytes(4);
-      if (!ipv4) return socket.destroy();
-      host = `${ipv4[0]}.${ipv4[1]}.${ipv4[2]}.${ipv4[3]}`;
-    } else if (addrType === 0x03) {
-      const domainLenRaw = await reader.readBytes(1);
-      if (!domainLenRaw) return socket.destroy();
-
-      const domainRaw = await reader.readBytes(domainLenRaw[0]);
-      if (!domainRaw || !domainRaw.length) return socket.destroy();
-      host = domainRaw.toString("utf8");
-    } else if (addrType === 0x04) {
-      const ipv6Raw = await reader.readBytes(16);
-      if (!ipv6Raw) return socket.destroy();
-      // Use canonical colon-separated bytes; DNS not needed for outbound connect.
-      const groups = [];
-      for (let i = 0; i < 16; i += 2) {
-        groups.push(ipv6Raw.readUInt16BE(i).toString(16));
-      }
-      host = groups.join(":");
-    } else {
-      sendSocks5Reply(socket, 0x08);
-      return socket.end();
-    }
-
-    const portRaw = await reader.readBytes(2);
-    if (!portRaw) return socket.destroy();
-    const port = portRaw.readUInt16BE(0);
-
-    logClient("SOCKS5", client, `connect ${host}:${port}`);
-
-    let upstream;
-    try {
-      upstream = await connectTcp(host, port);
-    } catch {
-      sendSocks5Reply(socket, 0x05);
-      return socket.end();
-    }
-
-    sendSocks5Reply(socket, 0x00);
 
     const buffered = reader.takeBuffered();
     reader.release();
@@ -414,25 +301,37 @@ const socks4Server = net.createServer((socket) => {
   });
 });
 
-const socks5Server = net.createServer((socket) => {
+const socks5Server = simpleSocks.createServer({
+  authenticate(username, password, socket, callback) {
+    const client = getSocketClient(socket);
+
+    if (username !== USERNAME || password !== PASSWORD) {
+      logClient("SOCKS5", client, `auth failed user=${username || "(empty)"}`);
+      return setImmediate(callback, new Error("invalid username/password"));
+    }
+
+    logClient("SOCKS5", client, `authenticated user=${username || "(empty)"}`);
+    return setImmediate(callback);
+  },
+  connectionFilter(destination, origin, callback) {
+    logClient(
+      "SOCKS5",
+      getInfoClient(origin),
+      `connect ${destination.address || "unknown"}:${destination.port || "?"}`
+    );
+    return setImmediate(callback);
+  }
+});
+
+socks5Server.on("handshake", (socket) => {
   logSocketClient("SOCKS5", socket, "tcp connected");
+});
 
-  socket.once("data", (firstChunk) => {
-    if (!firstChunk || !firstChunk.length) {
-      return socket.destroy();
-    }
-
-    if (firstChunk[0] !== 0x05) {
-      logSocketClient("SOCKS5", socket, `invalid version=0x${firstChunk[0].toString(16)}`);
-      return socket.destroy();
-    }
-
-    handleSocks5(socket, firstChunk);
-  });
-
-  socket.on("error", () => {
-    // Prevent unhandled socket errors from crashing the process.
-  });
+socks5Server.on("proxyError", (err) => {
+  if (err && err.code === "ECONNRESET") {
+    return;
+  }
+  console.error("SOCKS5 proxy error:", err.message);
 });
 
 socks4Server.on("error", (err) => {
