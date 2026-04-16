@@ -1,0 +1,16 @@
+{
+  "name": "multi-proxy-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HTTP + SOCKS4 + SOCKS5 proxy on separate ports with auth",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "proxy-chain": "^2.7.1"
+  }
+}
